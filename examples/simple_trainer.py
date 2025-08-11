@@ -1491,94 +1491,228 @@ class Runner:
 
     @torch.no_grad()
     def render_traj(self, step: int):
-        """Entry for trajectory rendering."""
+        """
+        轨迹渲染函数：生成沿指定相机轨迹的渲染视频
+        
+        该方法用于在训练过程中或训练结束后生成演示视频，展示3D高斯点云模型
+        在不同视角下的渲染效果。支持多种轨迹类型：插值、椭圆、螺旋等。
+        
+        @torch.no_grad() 装饰器的作用：
+        - 禁用梯度计算，节省内存和计算资源
+        - 这是推理过程，不需要更新模型参数
+        
+        @param step: 当前训练步数，用于视频文件命名
+        """
+        # ===== 检查是否禁用视频生成 =====
         if self.cfg.disable_video:
-            return
+            return  # 如果配置中禁用了视频生成，直接返回
+        
         print("Running trajectory rendering...")
-        cfg = self.cfg
-        device = self.device
+        
+        # ===== 基础配置获取 =====
+        cfg = self.cfg  # 训练配置对象
+        device = self.device  # 当前GPU设备
 
-        camtoworlds_all = self.parser.camtoworlds[5:-5]
+        # ===== 获取基础相机轨迹 =====
+        # 从解析器中获取所有训练相机的姿态，去掉首尾各5个相机避免边界效应
+        # 这样可以确保插值轨迹更加平滑和稳定
+        camtoworlds_all = self.parser.camtoworlds[5:-5]  # [N-10, 4, 4] 相机到世界坐标变换矩阵
+        
+        # ===== 根据配置生成不同类型的相机轨迹 =====
         if cfg.render_traj_path == "interp":
+            # 插值轨迹：在现有相机位置之间进行平滑插值
+            # 这种方式能够重现训练时的视角变化，适合展示模型对训练视角的重建质量
             camtoworlds_all = generate_interpolated_path(
-                camtoworlds_all, 1
-            )  # [N, 3, 4]
+                camtoworlds_all, 1  # 插值因子为1，表示在每两个相机之间插入1个新视角
+            )  # [N', 3, 4] 返回插值后的相机轨迹（注意：这里是3x4形式，缺少齐次坐标行）
+            
         elif cfg.render_traj_path == "ellipse":
-            height = camtoworlds_all[:, 2, 3].mean()
+            # 椭圆轨迹：生成围绕场景的椭圆形飞行路径
+            # 适合全方位展示3D场景，提供cinematic的观看体验
+            height = camtoworlds_all[:, 2, 3].mean()  # 计算所有相机的平均高度（Z坐标）
             camtoworlds_all = generate_ellipse_path_z(
-                camtoworlds_all, height=height
-            )  # [N, 3, 4]
+                camtoworlds_all, height=height  # 在指定高度生成椭圆轨迹
+            )  # [N', 3, 4] 椭圆轨迹的相机姿态
+            
         elif cfg.render_traj_path == "spiral":
+            # 螺旋轨迹：生成螺旋上升或下降的相机路径
+            # 提供更加动态和立体的视角变化，适合复杂场景的展示
             camtoworlds_all = generate_spiral_path(
-                camtoworlds_all,
-                bounds=self.parser.bounds * self.scene_scale,
-                spiral_scale_r=self.parser.extconf["spiral_radius_scale"],
-            )
+                camtoworlds_all,  # 基础相机轨迹
+                bounds=self.parser.bounds * self.scene_scale,  # 场景边界，调整螺旋范围
+                spiral_scale_r=self.parser.extconf["spiral_radius_scale"],  # 螺旋半径缩放因子
+            )  # [N', 3, 4] 螺旋轨迹的相机姿态
+            
         else:
+            # 不支持的轨迹类型，抛出错误
             raise ValueError(
                 f"Render trajectory type not supported: {cfg.render_traj_path}"
             )
 
+        # ===== 补全齐次坐标 =====
+        # 轨迹生成函数返回的是3x4变换矩阵，需要补充最后一行[0, 0, 0, 1]成为4x4齐次变换矩阵
         camtoworlds_all = np.concatenate(
             [
-                camtoworlds_all,
+                camtoworlds_all,  # 原始的3x4变换矩阵
+                # 为每个相机姿态添加齐次坐标行[0, 0, 0, 1]
                 np.repeat(
-                    np.array([[[0.0, 0.0, 0.0, 1.0]]]), len(camtoworlds_all), axis=0
+                    np.array([[[0.0, 0.0, 0.0, 1.0]]]),  # 齐次坐标行
+                    len(camtoworlds_all),  # 重复N'次，对应每个相机姿态
+                    axis=0  # 在批次维度上重复
                 ),
             ],
-            axis=1,
-        )  # [N, 4, 4]
+            axis=1,  # 在矩阵的行维度上拼接
+        )  # [N', 4, 4] 完整的齐次变换矩阵
 
+        # ===== 数据类型转换和设备迁移 =====
+        # 将numpy数组转换为PyTorch张量并移动到GPU
         camtoworlds_all = torch.from_numpy(camtoworlds_all).float().to(device)
+        
+        # 获取相机内参矩阵（使用第一个相机的内参，假设所有相机内参相同）
         K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
+        
+        # 获取图像尺寸（使用第一张图像的尺寸）
         width, height = list(self.parser.imsize_dict.values())[0]
 
-        # save to video
+        # ===== 视频保存设置 =====
+        # 创建视频保存目录
         video_dir = f"{cfg.result_dir}/videos"
         os.makedirs(video_dir, exist_ok=True)
+        
+        # 创建视频写入器，设置输出路径和帧率
         writer = imageio.get_writer(f"{video_dir}/traj_{step}.mp4", fps=30)
+        
+        # ===== 轨迹渲染循环 =====
+        # 遍历轨迹上的每个相机位置，逐帧渲染
         for i in tqdm.trange(len(camtoworlds_all), desc="Rendering trajectory"):
-            camtoworlds = camtoworlds_all[i : i + 1]
-            Ks = K[None]
+            # ===== 准备单帧渲染的相机参数 =====
+            # 提取当前帧的相机姿态，保持批次维度
+            camtoworlds = camtoworlds_all[i : i + 1]  # [1, 4, 4]
+            Ks = K[None]  # [1, 3, 3] 为内参矩阵添加批次维度
 
+            # ===== 渲染当前视角 =====
             renders, _, _ = self.rasterize_splats(
-                camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                sh_degree=cfg.sh_degree,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                render_mode="RGB+ED",
-            )  # [1, H, W, 4]
+                camtoworlds=camtoworlds,    # 当前相机姿态
+                Ks=Ks,                      # 相机内参
+                width=width,                # 图像宽度
+                height=height,              # 图像高度
+                sh_degree=cfg.sh_degree,    # 使用完整的球谐阶数
+                near_plane=cfg.near_plane,  # 近裁剪平面
+                far_plane=cfg.far_plane,    # 远裁剪平面
+                render_mode="RGB+ED",       # 渲染模式：RGB颜色 + 期望深度
+            )  # [1, H, W, 4] 渲染结果包含RGB和深度通道
+            
+            # ===== 图像后处理 =====
+            # 提取RGB颜色通道并限制在[0,1]范围内
             colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
+            
+            # 提取深度通道
             depths = renders[..., 3:4]  # [1, H, W, 1]
+            
+            # 深度归一化：将深度值映射到[0,1]范围，便于可视化
+            # 使用min-max归一化，使最近点为0（黑色），最远点为1（白色）
             depths = (depths - depths.min()) / (depths.max() - depths.min())
+            
+            # 准备画布：将颜色和深度图并排显示
+            # 深度图复制到3个通道以匹配RGB格式
             canvas_list = [colors, depths.repeat(1, 1, 1, 3)]
 
-            # write images
-            canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
+            # ===== 图像格式转换和保存 =====
+            # 水平拼接颜色图和深度图
+            canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()  # [H, W*2, 3]
+            
+            # 转换为8位整数像素值
             canvas = (canvas * 255).astype(np.uint8)
+            
+            # 将当前帧添加到视频中
             writer.append_data(canvas)
-        writer.close()
+        
+        # ===== 完成视频生成 =====
+        writer.close()  # 关闭视频写入器，确保文件正确保存
         print(f"Video saved to {video_dir}/traj_{step}.mp4")
 
     @torch.no_grad()
     def run_compression(self, step: int):
-        """Entry for running compression."""
+        """
+        模型压缩运行函数：对3D高斯点云模型进行压缩并评估压缩效果
+        
+        该方法实现了完整的模型压缩和评估流程，主要用于：
+        1. 将训练好的高斯点云模型进行压缩以减少存储空间
+        2. 测试压缩算法对模型质量的影响
+        3. 为模型部署提供更紧凑的表示形式
+        
+        @torch.no_grad() 装饰器的作用：
+        - 禁用自动梯度计算，节省内存开销
+        - 压缩和评估过程不需要梯度信息
+        - 避免意外修改模型参数
+        
+        @param step: 当前训练步数，用于标识压缩时机和结果文件命名
+        """
         print("Running compression...")
-        world_rank = self.world_rank
-
+        
+        # ===== 获取分布式训练信息 =====
+        world_rank = self.world_rank  # 当前进程在分布式训练中的排名
+        
+        # ===== 创建压缩结果存储目录 =====
+        # 为每个进程创建独立的压缩目录，避免多进程同时写入冲突
+        # 目录结构：{result_dir}/compression/rank{rank_id}
         compress_dir = f"{cfg.result_dir}/compression/rank{world_rank}"
-        os.makedirs(compress_dir, exist_ok=True)
+        os.makedirs(compress_dir, exist_ok=True)  # 创建目录，如果已存在则不报错
 
+        # ===== 执行模型压缩 =====
+        # 调用压缩方法将当前的高斯点云模型进行压缩
+        # self.compression_method 在初始化时根据配置创建（如PngCompression等）
+        # 压缩过程会将模型参数转换为更紧凑的表示形式并保存到指定目录
         self.compression_method.compress(compress_dir, self.splats)
+        
+        # 压缩方法的作用：
+        # - 将高斯点的各种参数（位置、尺度、旋转、不透明度、颜色等）进行有损或无损压缩
+        # - 使用专门的压缩算法（如PNG图像压缩）减少数据存储大小
+        # - 保存压缩后的数据到文件系统中
 
-        # evaluate compression
+        # ===== 评估压缩效果 =====
+        print("Evaluating compression quality...")
+        
+        # 第一步：解压缩模型
+        # 从压缩文件中恢复模型参数，模拟实际使用时的解压过程
         splats_c = self.compression_method.decompress(compress_dir)
+        
+        # 解压缩过程的作用：
+        # - 从压缩文件中读取数据并还原为张量格式
+        # - 可能存在量化误差或其他压缩引入的精度损失
+        # - 返回的数据格式与原始模型参数保持一致
+        
+        # 第二步：替换当前模型参数
+        # 将解压缩后的参数重新加载到模型中，替换原始的未压缩参数
         for k in splats_c.keys():
+            # 遍历所有参数类型（means, scales, quats, opacities, sh0, shN等）
+            # 将解压缩的参数数据复制到原始参数的data属性中
+            # .to(self.device) 确保数据在正确的GPU设备上
             self.splats[k].data = splats_c[k].to(self.device)
+        
+        # 参数替换的意义：
+        # - 使用压缩后再解压的参数进行评估，真实反映压缩对质量的影响
+        # - 保持原有的参数结构和优化器状态
+        # - 只更新参数值，不改变模型架构
+        
+        # 第三步：运行压缩模型评估
+        # 使用压缩后的模型在验证集上进行评估，测量压缩对渲染质量的影响
         self.eval(step=step, stage="compress")
+        
+        # 评估过程包括：
+        # - 使用压缩后的模型渲染验证集图像
+        # - 计算PSNR、SSIM、LPIPS等图像质量指标
+        # - 将评估结果保存为"compress"阶段的数据
+        # - 结果文件命名格式：compress_step{step:04d}.json
+        
+        # ===== 压缩效果分析 =====
+        # 通过对比压缩前后的评估指标，可以分析：
+        # 1. 压缩率（文件大小减少比例）
+        # 2. 质量损失（PSNR/SSIM/LPIPS的变化）
+        # 3. 压缩算法的性能权衡
+        # 4. 不同压缩参数设置的效果
+
+    print("Compression and evaluation completed.")
 
     @torch.no_grad()
     def _viewer_render_fn(
@@ -1655,82 +1789,216 @@ class Runner:
 
 
 def main(local_rank: int, world_rank, world_size: int, cfg: Config):
+    """
+    主函数：3D高斯点云训练和评估的程序入口
+    
+    该函数是整个程序的核心入口，负责协调训练和评估流程，包括：
+    1. 分布式训练配置的处理
+    2. 训练器(Runner)实例的创建和初始化
+    3. 根据配置决定执行训练或评估模式
+    4. 检查点加载和模型恢复
+    5. 可视化查看器的管理
+    
+    @param local_rank: 当前GPU在单机内的本地排名（0到GPU数量-1）
+    @param world_rank: 当前进程在全局分布式训练中的排名
+    @param world_size: 分布式训练的总进程数量
+    @param cfg: 包含所有训练和评估配置的Config对象
+    """
+    
+    # ===== 分布式训练配置检查 =====
+    # 在分布式训练模式下，自动禁用可视化查看器以避免冲突
     if world_size > 1 and not cfg.disable_viewer:
-        cfg.disable_viewer = True
+        cfg.disable_viewer = True  # 强制禁用查看器
+        # 只在主进程输出提示信息，避免重复打印
         if world_rank == 0:
             print("Viewer is disabled in distributed training.")
+    
+    # 分布式训练禁用查看器的原因：
+    # 1. 多个进程同时尝试启动Web服务器会导致端口冲突
+    # 2. 查看器界面只需要一个进程提供即可
+    # 3. 减少多进程间的同步复杂度
 
+    # ===== 创建训练器实例 =====
+    # Runner类是整个训练和评估流程的管理器
+    # 它会初始化数据加载器、模型、优化器、评估指标等所有组件
     runner = Runner(local_rank, world_rank, world_size, cfg)
 
+    # ===== 模式选择：评估模式 vs 训练模式 =====
     if cfg.ckpt is not None:
-        # run eval only
+        # ===== 评估模式：从检查点加载模型并进行评估 =====
+        # 当提供了检查点文件时，跳过训练直接进行模型评估
+        
+        print("Loading checkpoints for evaluation...")
+        
+        # 加载所有指定的检查点文件
+        # cfg.ckpt 是检查点文件路径列表，支持加载多个检查点（用于模型集成）
         ckpts = [
             torch.load(file, map_location=runner.device, weights_only=True)
             for file in cfg.ckpt
         ]
+        # weights_only=True: 只加载模型权重，提高安全性和加载速度
+        # map_location=runner.device: 将模型直接加载到目标设备上
+        
+        # 合并多个检查点的参数（如果提供多个检查点）
+        # 这种设计支持分布式训练中每个进程保存自己负责的高斯点
         for k in runner.splats.keys():
+            # 遍历所有参数类型（means, scales, quats, opacities等）
+            # 将来自不同检查点的同类参数在第0维度上拼接
             runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
-        step = ckpts[0]["step"]
+        
+        # 参数合并的意义：
+        # - 分布式训练时每个进程只保存部分高斯点
+        # - 评估时需要将所有进程的高斯点合并成完整模型
+        # - torch.cat在dim=0上拼接，恢复完整的点云数据
+        
+        # 获取训练步数（用于结果文件命名）
+        step = ckpts[0]["step"]  # 使用第一个检查点的步数作为标识
+        
+        # ===== 执行各种评估任务 =====
+        
+        # 1. 标准模型评估：在验证集上计算图像质量指标
         runner.eval(step=step)
+        
+        # 2. 轨迹渲染：生成演示视频展示不同视角的渲染效果
         runner.render_traj(step=step)
+        
+        # 3. 模型压缩（如果启用）：测试压缩算法对模型质量的影响
         if cfg.compression is not None:
             runner.run_compression(step=step)
+        
+        print("Evaluation completed.")
+        
     else:
+        # ===== 训练模式：从头开始训练模型 =====
+        # 当没有提供检查点时，执行完整的训练流程
+        
+        print("Starting training from scratch...")
         runner.train()
+        
+        # 训练过程包括：
+        # - 数据加载和预处理
+        # - 前向传播和损失计算
+        # - 反向传播和参数更新
+        # - 密集化策略执行
+        # - 定期评估和检查点保存
+        # - 实时可视化监控
 
+    # ===== 可视化查看器管理 =====
+    # 如果启用了查看器，保持其运行状态供用户交互
     if not cfg.disable_viewer:
+        # 完成查看器的初始化设置
         runner.viewer.complete()
+        
+        # 提示用户查看器已就绪
         print("Viewer running... Ctrl+C to exit.")
-        time.sleep(1000000)
+        
+        # 保持程序运行，让用户可以通过Web界面查看结果
+        # 使用长时间sleep而不是无限循环，便于响应键盘中断
+        time.sleep(1000000)  # 睡眠约11.5天，实际上用户会通过Ctrl+C退出
+        
+        # 查看器的功能：
+        # - 实时显示训练进度和渲染结果
+        # - 提供交互式的相机控制
+        # - 支持不同渲染模式的切换
+        # - 显示性能统计信息
+
+    print("Program completed.")
 
 
 if __name__ == "__main__":
+    """
+    程序入口：处理命令行参数和配置，启动3D高斯点云训练程序
+    
+    该入口块负责：
+    1. 提供使用说明和示例命令
+    2. 定义不同的训练配置选项
+    3. 处理命令行参数解析
+    4. 根据配置动态导入必要的依赖包
+    5. 验证配置的合理性
+    6. 启动主程序
+    """
+    
+    # ===== 使用说明文档 =====
     """
     Usage:
 
     ```bash
     # Single GPU training
+    # 单GPU训练示例：使用9号GPU，采用默认配置
     CUDA_VISIBLE_DEVICES=9 python -m examples.simple_trainer default
 
     # Distributed training on 4 GPUs: Effectively 4x batch size so run 4x less steps.
+    # 分布式训练示例：使用4个GPU（0,1,2,3），由于有效批大小变为4倍，所以训练步数缩减为1/4
     CUDA_VISIBLE_DEVICES=0,1,2,3 python simple_trainer.py default --steps_scaler 0.25
 
     """
+    # 使用说明解释：
+    # - CUDA_VISIBLE_DEVICES: 指定使用的GPU设备
+    # - python -m examples.simple_trainer: 以模块方式运行程序
+    # - default/mcmc: 选择预定义的配置模板
+    # - --steps_scaler: 调整训练步数的缩放因子
 
+    # ===== 预定义配置选项 =====
     # Config objects we can choose between.
     # Each is a tuple of (CLI description, config object).
+    # 可选择的配置对象，每个都是(命令行描述, 配置对象)的元组
     configs = {
         "default": (
+            # 默认配置：使用原始论文中的密集化启发式方法进行高斯点云训练
             "Gaussian splatting training using densification heuristics from the original paper.",
             Config(
-                strategy=DefaultStrategy(verbose=True),
+                strategy=DefaultStrategy(verbose=True),  # 使用默认策略，启用详细输出
             ),
         ),
         "mcmc": (
+            # MCMC配置：使用MCMC论文中的密集化方法进行训练
             "Gaussian splatting training using densification from the paper '3D Gaussian Splatting as Markov Chain Monte Carlo'.",
             Config(
-                init_opa=0.5,
-                init_scale=0.1,
-                opacity_reg=0.01,
-                scale_reg=0.01,
-                strategy=MCMCStrategy(verbose=True),
+                # MCMC策略的特殊参数设置
+                init_opa=0.5,           # 更高的初始不透明度
+                init_scale=0.1,         # 更小的初始尺度
+                opacity_reg=0.01,       # 不透明度正则化权重
+                scale_reg=0.01,         # 尺度正则化权重
+                strategy=MCMCStrategy(verbose=True),  # 使用MCMC策略
             ),
         ),
     }
+    
+    # ===== 命令行参数解析 =====
+    # 使用tyro库创建可重写的配置命令行接口
+    # 用户可以选择预定义配置，也可以通过命令行参数覆盖任何配置项
     cfg = tyro.extras.overridable_config_cli(configs)
+    
+    # tyro.extras.overridable_config_cli的功能：
+    # 1. 根据configs字典创建命令行选择器
+    # 2. 允许用户通过--参数名的方式覆盖配置
+    # 3. 自动生成帮助信息和类型检查
+    # 4. 支持嵌套配置对象的参数覆盖
+    
+    # ===== 训练步数调整 =====
+    # 根据步数缩放因子调整所有与步数相关的参数
     cfg.adjust_steps(cfg.steps_scaler)
+    
+    # 步数调整的意义：
+    # - 分布式训练时有效批大小增加，需要相应减少训练步数
+    # - 保持训练收敛性和效果的一致性
+    # - 自动调整评估、保存等关键步数节点
 
+    # ===== 条件依赖导入：双边网格功能 =====
     # Import BilateralGrid and related functions based on configuration
+    # 根据配置条件导入双边网格相关函数，避免不必要的依赖
     if cfg.use_bilateral_grid or cfg.use_fused_bilagrid:
         if cfg.use_fused_bilagrid:
-            cfg.use_bilateral_grid = True
+            # 使用融合版本的双边网格实现（性能更优）
+            cfg.use_bilateral_grid = True  # 确保标志位正确设置
             from fused_bilagrid import (
-                BilateralGrid,
-                color_correct,
-                slice,
-                total_variation_loss,
+                BilateralGrid,          # 双边网格主类
+                color_correct,          # 颜色校正函数
+                slice,                  # 网格切片函数
+                total_variation_loss,   # 总变差损失函数
             )
         else:
+            # 使用标准版本的双边网格实现
             cfg.use_bilateral_grid = True
             from lib_bilagrid import (
                 BilateralGrid,
@@ -1738,20 +2006,55 @@ if __name__ == "__main__":
                 slice,
                 total_variation_loss,
             )
+    
+    # 条件导入的优点：
+    # 1. 只在需要时导入，减少启动时间
+    # 2. 避免可选依赖缺失导致的错误
+    # 3. 支持不同实现版本之间的切换
 
+    # ===== 条件依赖导入：PNG压缩功能 =====
     # try import extra dependencies
+    # 尝试导入额外的依赖包，用于PNG压缩功能
     if cfg.compression == "png":
         try:
-            import plas
-            import torchpq
-        except:
+            import plas      # PLAS压缩库
+            import torchpq   # PyTorch量化库
+        except ImportError:
+            # 如果依赖缺失，提供详细的安装指导
             raise ImportError(
                 "To use PNG compression, you need to install "
                 "torchpq (instruction at https://github.com/DeMoriarty/TorchPQ?tab=readme-ov-file#install) "
                 "and plas (via 'pip install git+https://github.com/fraunhoferhhi/PLAS.git') "
             )
+    
+    # 依赖检查的重要性：
+    # 1. PNG压缩是可选功能，不应该影响基础训练
+    # 2. 提供明确的安装指导，帮助用户解决依赖问题
+    # 3. 使用try-except确保程序的健壮性
 
+    # ===== 配置一致性检查 =====
+    # 验证无迹变换(Unscented Transform)相关配置的一致性
     if cfg.with_ut:
+        # 如果启用无迹变换，必须同时启用3D评估
         assert cfg.with_eval3d, "Training with UT requires setting `with_eval3d` flag."
+    
+    # 配置验证的意义：
+    # 1. 确保相关功能的配置组合是有效的
+    # 2. 在程序启动时就发现配置问题，而不是在训练过程中
+    # 3. 提供清晰的错误提示，帮助用户正确配置
 
+    # ===== 启动主程序 =====
+    # 使用gsplat提供的cli函数启动分布式训练或单GPU训练
     cli(main, cfg, verbose=True)
+    
+    # cli函数的功能：
+    # 1. 自动检测可用的GPU数量
+    # 2. 根据GPU数量决定是否启用分布式训练
+    # 3. 为每个GPU进程分配local_rank和world_rank
+    # 4. 处理分布式训练的初始化和同步
+    # 5. 调用main函数开始实际的训练或评估
+    
+    # 参数说明：
+    # - main: 要执行的主函数
+    # - cfg: 完整的配置对象
+    # - verbose=True: 启用详细输出，显示分布式训练信息
